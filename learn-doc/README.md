@@ -22,6 +22,9 @@ llama.cpp 这个仓库其实是两个项目叠在一起:
 5. [分词、采样、聊天模板](05-vocab-sampling-chat.md) - 三个相对独立的能力
 6. [走进 ggml](06-ggml.md) - 性能和后端
 7. [过时概念对照表和常见坑](07-pitfalls.md) - 读代码之前先看这个
+8. [读懂 llama-bench 的 pp / tg 数字](08-bench-metrics.md) - 判断速度有没有跑满
+9. [附录:读懂一个 GGUF 文件的名字和超参](09-model-file.md) - 4B / Q4_K_M 是什么意思,上下文窗口和输出上限从哪查
+10. [附录:分词为什么不是一个字一个 token](10-tokenizer-bpe.md) - BPE 原理、词表实测、分词表存在哪
 
 ## 建议节奏
 

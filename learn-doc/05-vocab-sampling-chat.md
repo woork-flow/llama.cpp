@@ -50,6 +50,8 @@ build/bin/llama-tokenize -m model.gguf -p "你好世界" --ids   # 只看 id
 
 对应测试:`tests/test-tokenizer-0.cpp`、`test-tokenizer-1-bpe.cpp`、`test-tokenizer-1-spm.cpp`。测试里的用例是最好的行为文档。
 
+BPE 到底怎么合并、中文为什么不是一个字一个 token、分词表存在 GGUF 的哪个字段,见[附录第 10 章](10-tokenizer-bpe.md)。
+
 ## 5.2 采样:`src/llama-sampler.cpp`
 
 4381 行,但结构非常规整:每个采样器是一个实现了 `llama_sampler_i` 接口的结构体。
