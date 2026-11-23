@@ -97,7 +97,7 @@ build/bin/llama-bench -m model.gguf
 输出 pp(prompt processing)和 tg(token generation)两个速度。以后改任何代码,先跑这个看有没有变慢。
 
 ```
-linux@linux-System-Product-Name:~/code/native/llama.cpp$ build/bin/llama-bench -m ./models/Qwen3.5-4B-Q4_K_M.gguf
+linux@linux-System-Product-Name:~/code/native/llama.cpp$ build/bin/llama-bench -m ./models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf
 ggml_cuda_init: found 1 CUDA devices (Total VRAM: 7782 MiB):
   Device 0: NVIDIA GeForce RTX 4060, compute capability 8.9, VMM: yes, VRAM: 7782 MiB
 | model                          |       size |     params | backend    | ngl |            test |                  t/s |
@@ -115,7 +115,7 @@ build/bin/llama-tokenize -m model.gguf -p "hello world"
 ```
 
 ```
-linux@linux-System-Product-Name:~/code/native/llama.cpp$ build/bin/llama-tokenize -m ./models/Qwen3.5-4B-Q4_K_M.gguf -p 你好呀中国人
+linux@linux-System-Product-Name:~/code/native/llama.cpp$ build/bin/llama-tokenize -m ./models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf -p 你好呀中国人
 0.00.421.783 W llama_context: n_ctx_seq (512) > n_ctx_train (0) -- possible training context overflow
 109266 -> '你好'
 102894 -> '呀'
@@ -177,5 +177,60 @@ tg128     64 t/s
 2. 把 `-ngl` 从 0 试到 99,画出速度曲线,找到"刚好全放显存"的临界点。
 3. 用 `llama-tokenize` 看看中文和英文分别被切成几个 token,理解为什么中文更费上下文。
 4. 用 `llama-perplexity` 跑同一个模型的两个量化版本(比如 Q4_K_M 和 Q8_0),看困惑度差多少。
+
+### 练习 2 的实测结果
+
+2026-11 在这台机器上扫的(Qwen3.5-4B Q4_K_M,32 层,显存空闲 6.2G):
+
+```sh
+build/bin/llama-bench -m models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf -ngl 0,6,12,18,24,28,32,33,99
+```
+
+| ngl | pp512 (t/s) | tg128 (t/s) | 备注 |
+|---:|---:|---:|---|
+| 0 | 1187 | 19.8 | 纯 CPU |
+| 6 | 1354 | 24.9 | |
+| 12 | 1589 | 27.4 | |
+| 18 | 1905 | 33.6 | |
+| 24 | 2438 | 42.0 | |
+| 28 | 2915 | 49.8 | |
+| 32 | 3787 | 64.2 | 层数放满,但还差一层 |
+| 33 | 4149 | 70.5 | 临界点:全部上卡 |
+| 99 | 4181 | 71.0 | 饱和,和 33 持平 |
+
+要点:
+
+- 临界点是 **ngl = n_layer + 1 = 33**,不是 32。offload 按 `n_layer + 1` 个层(32 个 block 加 1 个输出层)从后往前数,见 `src/llama-model.cpp` 的 `i_gpu_start = n_layer_all + 1 - n_gpu_layers`。`-ngl 32` 时第 0 个 block 还在 CPU 上,每个 token 多一次 GPU-CPU 折返,这就是 32 到 33 那一跳(tg +10%)的来源。
+- `-ngl 99` 和 33 完全持平,99 只是"保证超过 n_layer + 1"的习惯写法。默认的 `-ngl -1` 实测 tg 68.9,也是全放档。
+- 全放时显存峰值约 4.9G(含桌面占用 1.5G),模型侧约 3.4G = 权重 2.8G + KV + 计算 buffer。8G 卡放这个模型绰绰有余,所以只看到性能拐点,没看到 OOM 一侧;换 13B 以上的模型才会撞 `unable to allocate CUDA0 buffer`。
+- 换 0.8B(24 层)扫出来形状一样:拐点在 25,tg 从 64 线性涨到 232 t/s。
+- 上面"参考基线"记的 tg 64 比这几轮全放档(69 到 71)低一截,同机同 build,差异来自测量环境。定基线前先看 `nvidia-smi`,跑完也别只信一次。
+
+### 练习 4 的实测结果
+
+2026-11 在这台机器上跑的(RTX 4060 8G,语料用 `scripts/get-wikitext-2.sh` 下载的 wikitext-2-raw,`-c 512`,全部 580 个 chunk 约 29.7 万 token):
+
+```sh
+sh scripts/get-wikitext-2.sh
+build/bin/llama-perplexity -m models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf -f wikitext-2-raw/wiki.test.raw -c 512
+build/bin/llama-perplexity -m models/Qwen3.5-4B/Qwen3.5-4B-Q8_0.gguf   -f wikitext-2-raw/wiki.test.raw -c 512
+build/bin/llama-perplexity -m models/Qwen3.5-0.8B/Qwen3.5-0.8B-Base-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 512
+```
+
+| 模型 | 量化 | PPL | 耗时 |
+|---|---|---:|---:|
+| Qwen3.5-4B | Q8_0 | 9.956 +/- 0.072 | 127 s |
+| Qwen3.5-4B | Q4_K_M | 10.160 +/- 0.073 | 101 s |
+| Qwen3.5-0.8B-Base | Q8_0 | 13.961 +/- 0.103 | 43 s |
+
+两个 4B 文件都来自 ggml-org/Qwen3.5-4B-GGUF,文件大小与仓库逐字节一致,同源可比。
+
+要点:
+
+- **同模型对比才有结论**:Q4_K_M 对 Q8_0 是 10.160 对 9.956,+0.204 即 +2.1%,落在 Q4_K_M 的典型区间(0.5% 到 2% 略多一点)。结论:这个量化没有异常损伤,可以用。
+- **跨尺寸对比说明不了量化问题**:0.8B Q8_0 对 4B Q8_0 差 40%,容量差距远远压过任何量化档的影响。只跑 Q4_K_M 和 0.8B Q8_0 两个文件是得不出"量化伤没伤"的结论的。
+- ±0.07 是 580 个 chunk 间方差的标准误,不是量化噪声。0.204 的差约为合成误差的 2 倍,边缘显著但方向稳定;差值远超这个误差才算铁证。
+- Q8_0 比 Q4_K_M 贵 1.4GB 权重(4.48GB 对 3.03GB),pp 也慢了约 25%(127s 对 101s),换回来的只是 2% 的 PPL。日常用 Q4_K_M 是合理选择。
+- 想更直接地度量"伤了多少":`llama-perplexity --kl-divergence` 先用高精度模型存基准 logits,再算量化模型的 KL 散度和 top-1 翻转率,用法见 `tools/perplexity/README.md`。
 
 做完这些,你对这个项目的"外围"就有概念了,可以开始读代码。
