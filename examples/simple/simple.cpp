@@ -1,18 +1,32 @@
 #include "llama.h"
+
 #include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
+// 全程序骨架:
+//   1. 解析参数 -> llama_backend_init
+//   2. llama_model_load_from_file 加载 GGUF 权重
+//   3. llama_tokenize 把 prompt 转成 token
+//   4. llama_init_from_model 建 context(KV cache 在这里分配)
+//   5. llama_sampler_chain_init 建采样器链
+//   6. 循环: llama_process(DECODE) -> llama_sampler_sample -> 新 token 放进下一批
+//   7. 按申请的逆序释放: batch -> sampler -> ctx -> model
+
 // fill the batch with tokens at consecutive positions starting from pos_0, output logits only for the last one
 static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens, int32_t n_tokens, llama_pos pos_0) {
+    // 只清条目,不清容量。batch 内部数组是复用的,每轮重新 add 即可
     llama_batch_ext_clear(batch);
     for (int32_t i = 0; i < n_tokens; ++i) {
+        // 第二个参数是 seq_id,单序列推理固定写 0
         const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens[i]);
+        // 和旧版 llama_batch 不同,位置不会自动递增,必须自己填
         const llama_pos pos = pos_0 + i;
         llama_batch_ext_set_pos(batch, idx, &pos);
     }
+    // 只有最后一个位置要 logits,前面位置的输出算了也没人要
     llama_batch_ext_set_output_logits(batch, n_tokens - 1, true);
 }
 
@@ -23,6 +37,7 @@ static void print_usage(int, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // 固定 "C" locale,否则某些语言环境下 printf 浮点数会输出逗号做小数点
     std::setlocale(LC_NUMERIC, "C");
 
     // path to the model gguf file
@@ -35,6 +50,7 @@ int main(int argc, char ** argv) {
     int n_predict = 32;
 
     // parse command line arguments
+    // 手写解析,不用 common/arg.cpp,为了不引入依赖
 
     {
         int i = 1;
@@ -72,6 +88,7 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // prompt starts here
+                // 不是开关就当作 prompt 起点,后面的全部原样拼进 prompt
                 break;
             }
         }
@@ -81,6 +98,7 @@ int main(int argc, char ** argv) {
         }
         if (i < argc) {
             prompt = argv[i++];
+            // 多个 argv 用空格拼回一段文本
             for (; i < argc; i++) {
                 prompt += " ";
                 prompt += argv[i];
@@ -88,13 +106,16 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // 进程级初始化:注册后端(GPU 驱动、线程池等)。整个进程只需要调一次
     llama_backend_init();
 
     // initialize the model
 
     llama_model_params model_params = llama_model_default_params();
+    // 要 offload 多少层到 GPU。99 基本等于全部;0 就是纯 CPU
     model_params.n_gpu_layers = ngl;
 
+    // 加载权重。这一步只读 mmap 文件并建元数据,不分配 KV cache
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 
     if (model == NULL) {
@@ -102,13 +123,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // vocab 是 model 的一部分,所有权不在这里,不需要也不能 free
     const llama_vocab * vocab = llama_model_get_vocab(model);
     // tokenize the prompt
 
     // find the number of tokens in the prompt
+    // 第一次调用 buf=NULL、上限 0,只问长度:返回负数,取反才是 token 数
     const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
 
     // allocate space for the tokens and tokenize the prompt
+    // 后两个 true 分别是 add_special(加 BOS)和 parse_special(解析 <|...|> 这类特殊 token)
     std::vector<llama_token> prompt_tokens(n_prompt);
     if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
         fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
@@ -119,12 +143,15 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
+    // 上下文长度要覆盖 prompt + 将要生成的 token。减 1 是因为第一个 token 的 logits 不生成新 token
     ctx_params.n_ctx = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
+    // prefill 一次就要把整个 prompt 塞进去,所以 n_batch 至少得有 n_prompt
     ctx_params.n_batch = n_prompt;
     // enable performance counters
     ctx_params.no_perf = false;
 
+    // 建 context。KV cache、计算图、输出缓冲都在这里分配
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
@@ -134,6 +161,7 @@ int main(int argc, char ** argv) {
 
     // initialize the sampler
 
+    // 采样器是链式的:按 add 的顺序依次作用。这里只挂了 greedy,也就是每步取概率最大的 token
     auto sparams = llama_sampler_chain_default_params();
     sparams.no_perf = false;
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
@@ -142,8 +170,11 @@ int main(int argc, char ** argv) {
 
     // print the prompt token-by-token
 
+    // 把 token 逐个还原成文本回显。注意是逐 token 而不是直接打印原字符串:
+    // 特殊 token 会被渲染成字面形式,换行等也能正确还原
     for (auto id : prompt_tokens) {
         char buf[128];
+        // 返回字节数,不写 '\0';返回负值表示缓冲区不够
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n < 0) {
             fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
@@ -155,11 +186,15 @@ int main(int argc, char ** argv) {
 
     // prepare a batch for the prompt
 
+    // batch 绑定 ctx,内部缓冲由 ctx 管理,所以必须在 init_from_model 之后创建
     llama_batch_ext * batch = llama_batch_ext_init(ctx);
     int n_tokens = n_prompt; // number of tokens in the current batch
 
+    // prefill: 整个 prompt 一次喂进去,位置从 0 开始
     batch_set_tokens(batch, prompt_tokens.data(), n_prompt, 0);
 
+    // encoder-decoder 模型(如 T5)要先跑 encoder,再用 decoder_start_token 起步
+    // 纯 decoder 模型(绝大多数 LLM)不会进这个分支
     if (llama_model_has_encoder(model)) {
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_ENCODE, batch)) {
             fprintf(stderr, "%s : failed to eval\n", __func__);
@@ -171,6 +206,7 @@ int main(int argc, char ** argv) {
             decoder_start_token_id = llama_vocab_bos(vocab);
         }
 
+        // decoder 侧从头开始,位置重置为 0,批次里只有一个起始 token
         batch_set_tokens(batch, &decoder_start_token_id, 1, 0);
         n_tokens = 1;
     }
@@ -181,8 +217,12 @@ int main(int argc, char ** argv) {
     int n_decode = 0;
     llama_token new_token_id;
 
+    // n_pos 是已送进 KV cache 的 token 数,也是下一次 decode 要用的起始位置
+    // 循环条件保证不会超出 n_ctx 能容纳的长度
     for (int n_pos = 0; n_pos + n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
+        // 第一次是 prefill(整段 prompt),之后每次只有 1 个 token。
+        // 走的是同一个接口,差别只在 batch 大小
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
@@ -192,6 +232,9 @@ int main(int argc, char ** argv) {
 
         // sample the next token
         {
+            // -1 表示"取这一批最后一个位置的 logits"。
+            // llama_sampler_sample 内部会顺带调 llama_sampler_accept,
+            // 采样器自己的状态(如重复惩罚窗口)因此自动前进
             new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
             // is it an end of generation?
@@ -207,9 +250,12 @@ int main(int argc, char ** argv) {
             }
             std::string s(buf, n);
             printf("%s", s.c_str());
+            // 强制刷新,否则输出可能攒在缓冲区里,看起来像卡住了
             fflush(stdout);
 
             // prepare the next batch with the sampled token
+            // 自回归关键点:只喂刚采到的这 1 个 token,历史 token 已经在 KV cache 里,
+            // 不需要也不应该再喂一遍。位置接着 n_pos 往后排
             batch_set_tokens(batch, &new_token_id, 1, n_pos);
             n_tokens = 1;
 
@@ -221,6 +267,7 @@ int main(int argc, char ** argv) {
 
     const auto t_main_end = ggml_time_us();
 
+    // 注意分母是微秒换算成秒,再算 tokens/s
     fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
             __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
 
@@ -229,6 +276,7 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
     fprintf(stderr, "\n");
 
+    // 逆序释放:后申请的先生效,避免 dangling 引用
     llama_batch_ext_free(batch);
     llama_sampler_free(smpl);
     llama_free(ctx);

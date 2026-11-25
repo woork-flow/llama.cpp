@@ -12,6 +12,7 @@
 | `llama_context` | 一次推理会话的状态,独占 GPU 显存 | `llama_init_from_model`、`llama_decode`、`llama_free` |
 | `llama_sampler` | 采样器,可以串成链 | `llama_sampler_chain_init`、`llama_sampler_sample` |
 | `llama_batch` | 一次要处理的 token | `llama_batch_init`、`llama_batch_get_one` |
+| `llama_batch_ext` | 新版 batch,位置要手动设,支持 embd/state 等扩展 | `llama_batch_ext_init`、`llama_batch_ext_add_token`、`llama_batch_ext_set_pos` |
 | `llama_memory` | KV cache 的抽象(老版本没有这层) | 一般通过 context 间接用 |
 | `llama_vocab` | 分词器 | `llama_tokenize`、`llama_token_to_piece` |
 
@@ -31,20 +32,22 @@ llama_backend_init()                    // 全局初始化,进程级
 llama_backend_free()
 ```
 
+`llama_decode` 是老接口,配 `llama_batch`(位置自动递推)。`examples/simple/simple.cpp` 用的是新接口 `llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)`,配 `llama_batch_ext`(位置必须手动 `set_pos`)。两者语义一样,新接口能表达多模态、MTP 这类额外输入。
+
 一个 model 可以配多个 context,这在 server 里就是这样用的(多个 slot 共享一份权重,但各自有 KV cache)。
 
 ## 再读 `examples/simple/simple.cpp`
 
-238 行,最小的完整推理程序。按这个顺序读:
+286 行,最小的完整推理程序(文件里已经带中文注释,可对照着读)。按这个顺序读:
 
 1. `main()` 开头解析参数,注意 `llama_model_params` 和 `llama_context_params` 两个结构体的字段,它们对应命令行参数。
-2. 第 98 行 `llama_model_load_from_file`,加载 GGUF。
-3. 第 128 行 `llama_init_from_model`,建 context。注意 `n_ctx` 和 `n_batch` 的关系。
-4. 第 178 行开始的 main loop,这是核心:
-   - 第一轮用整段 prompt 调 `llama_decode`(prefill)
+2. 第 119 行 `llama_model_load_from_file`,加载 GGUF。
+3. 第 155 行 `llama_init_from_model`,建 context。注意 `n_ctx` 和 `n_batch` 的关系。
+4. 第 214 行开始的 main loop,这是核心:
+   - 第一轮用整段 prompt 调 `llama_process(..., DECODE, batch)`(prefill)
    - 之后每轮只喂 1 个 token(自回归生成)
-   - 每轮 `llama_sampler_sample(smpl, ctx, -1)`,这里的 `-1` 表示"取最后一个位置的 logits"
-5. 最后 `llama_batch_free`、`llama_sampler_free`、`llama_free`、`llama_model_free`,注意释放顺序和申请顺序相反。
+   - 每轮 `llama_sampler_sample(smpl, ctx, -1)`(第 238 行),这里的 `-1` 表示"取最后一个位置的 logits"
+5. 最后 `llama_batch_ext_free`、`llama_sampler_free`、`llama_free`、`llama_model_free`(第 280 行起),注意释放顺序和申请顺序相反。
 
 ## 三个容易忽略但很重要的点
 
